@@ -69,3 +69,27 @@ python dump.py ETHUSDT 2026-02-10T00:00:00-03:00 2026-02-10T06:00:00-03:00 /home
 - price
 - qty
 - side
+
+## Backtest de estrategia Rango 3 + Bollinger
+La estrategia Pine `Rango 3 Canales 25/50/25 + BB` esta disponible como `range3_bb`.
+
+Ejemplo con velas ya generadas:
+```bash
+python backtest_plotly.py data/generated_2026/ETHUSDT_2026_ytd_30m_ohlc.parquet \
+  --strategy range3_bb \
+  --tf 30min \
+  --entry next_open \
+  --notional 1000 \
+  --fee 0.0004 \
+  --sl 0.02 \
+  --out data/generated_2026/range3_bb_eth_30m_2026.html \
+  --out-trades data/generated_2026/range3_bb_eth_30m_2026_trades.csv
+```
+
+Parametros principales:
+- `--range-lookback` default `200`
+- `--range-pct-upper / --range-pct-middle / --range-pct-lower` default `25/50/25`
+- `--range-bb-signal-type`: `"Mecha + cierre"`, `"Cruce de cierre"` o `"Toque simple"`
+- `--range-pending-order-type`: `"Stop en banda"` o `"Limit en banda"`
+- `--range-new-extreme-bars` default `3`
+- `--range-use-opposite-tp` activa el TP por zona opuesta

@@ -21,6 +21,7 @@ from backtest_plotly import (
     generate_bollinger_signals,
     generate_supertrend_signals,
     run_backtest,
+    run_range3_bb_backtest,
 )
 
 app = FastAPI()
@@ -61,6 +62,7 @@ def _load_strategy_defaults() -> dict:
         "bollinger": {"sl": 0.02, "tp": 0.0},
         "supertrend": {"sl": 0.02, "tp": 0.0},
         "supertrend2": {"sl": 0.02, "tp": 0.05},
+        "range3_bb": {"sl": 0.02, "tp": 0.0},
     }
 
     # Bollinger (bot)
@@ -408,6 +410,27 @@ def _run_backtest_payload(payload: dict, progress_cb=None) -> dict[str, Any]:
         signals = generate_supertrend_signals(ohlcv, st)
         tp_pct = tp if tp > 0 else None
         trades, markers = run_backtest(ohlcv, signals, entry, sl, tp_pct, notional, fee, reentry_on_tp=False)
+    elif strategy == "range3_bb":
+        trades, markers, channels, bb = run_range3_bb_backtest(
+            ohlcv=ohlcv,
+            notional=notional,
+            fee_rate=fee,
+            bb_length=bb_length,
+            bb_mult=bb_mult,
+            stop_loss_pct=sl,
+            entry_mode=entry,
+        )
+        overlays.extend(
+            [
+                ("range_max", channels["max"]),
+                ("range_maxfloor", channels["maxfloor"]),
+                ("range_minroof", channels["minroof"]),
+                ("range_min", channels["min"]),
+                ("bb_upper", bb["upper"]),
+                ("bb_lower", bb["lower"]),
+                ("bb_basis", bb["basis"]),
+            ]
+        )
     else:
         raise ValueError("Estrategia inválida")
 
