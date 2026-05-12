@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+
+# Runtime/output data. These files are large and reproducible.
+data/
+logs/
+ui.log
+
+# Generated reports/exports.
+*.parquet
+*.csv
+/*.html

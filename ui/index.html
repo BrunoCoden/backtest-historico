@@ -1,0 +1,266 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Backtest UI</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    body { margin:0; font-family: Arial, sans-serif; background:#111; color:#eee; }
+    .bar { padding:12px 14px; border-bottom:1px solid #333; display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+    .bar input, .bar select, .bar button { padding:6px 8px; border-radius:4px; border:1px solid #333; background:#1b1b1b; color:#eee; }
+    .bar label { font-size:12px; opacity:0.8; margin-right:6px; }
+    #metrics { padding:8px 14px; font-size:14px; border-bottom:1px solid #333; }
+    #progress-wrap { padding:8px 14px; border-bottom:1px solid #333; display:none; }
+    #progress-text { font-size:12px; opacity:0.9; margin-bottom:6px; }
+    #progress-bar { width:100%; height:12px; }
+    #chart { height: 80vh; }
+  </style>
+</head>
+<body>
+  <div class="bar">
+    <label>Parquet</label><input type="file" id="file" accept=".parquet" />
+    <label>Estrategia</label>
+    <select id="strategy">
+      <option value="bollinger">Bollinger</option>
+      <option value="supertrend">Supertrend</option>
+      <option value="supertrend2">Supertrend2</option>
+    </select>
+    <label>TF</label><input id="tf" value="30T" size="4" />
+    <label>Entrada</label>
+    <select id="entry">
+      <option value="close">close</option>
+      <option value="next_open">next_open</option>
+    </select>
+    <label>SL</label><input id="sl" value="0.02" size="5" />
+    <label>TP</label><input id="tp" value="0.05" size="5" />
+    <label>Notional</label><input id="notional" value="30" size="6" />
+    <label>Fee</label><input id="fee" value="0.0004" size="6" />
+    <label>Start</label><input id="start" type="date" />
+    <label>End</label><input id="end" type="date" />
+    <button id="run">Run</button>
+    <button id="goto-latest">Ir a última vela</button>
+  </div>
+  <div id="metrics">Cargar un parquet para empezar.</div>
+  <div id="progress-wrap">
+    <div id="progress-text">Ejecutando...</div>
+    <progress id="progress-bar" max="100" value="0"></progress>
+  </div>
+  <div id="chart"></div>
+
+<script>
+const metricsEl = document.getElementById('metrics');
+const chartEl = document.getElementById('chart');
+const runBtnEl = document.getElementById('run');
+const progressWrapEl = document.getElementById('progress-wrap');
+const progressTextEl = document.getElementById('progress-text');
+const progressBarEl = document.getElementById('progress-bar');
+let tradesCache = [];
+let defaultRangeMin = null;
+let defaultRangeMax = null;
+let defaultsByStrategy = null;
+let activePoll = null;
+
+function formatLocalDate(dt) {
+  const pad = (n) => String(n).padStart(2, '0');
+  const yyyy = dt.getFullYear();
+  const mm = pad(dt.getMonth() + 1);
+  const dd = pad(dt.getDate());
+  return `${yyyy}-${mm}-${dd}`;
+}
+let latestRange = null;
+
+async function loadParquet() {
+  const fileInput = document.getElementById('file');
+  const file = fileInput.files[0];
+  if (!file) return;
+  const form = new FormData();
+  form.append('file', file);
+  metricsEl.textContent = 'Cargando parquet...';
+  const res = await fetch('/api/load', { method: 'POST', body: form });
+  const data = await res.json();
+  if (!data.ok) {
+    metricsEl.textContent = 'Error: ' + data.error;
+    return;
+  }
+  const dminIso = new Date(data.ts_min).toISOString();
+  const dmaxIso = new Date(data.ts_max).toISOString();
+  const dminLocal = formatLocalDate(new Date(data.ts_min));
+  const dmaxLocal = formatLocalDate(new Date(data.ts_max));
+  defaultsByStrategy = data.defaults || null;
+  defaultRangeMin = dminLocal;
+  defaultRangeMax = dmaxLocal;
+  document.getElementById('start').value = dminLocal;
+  document.getElementById('end').value = dmaxLocal;
+  applyDefaults();
+  metricsEl.textContent = `Parquet OK. Rows: ${data.rows}. Rango: ${dminIso} → ${dmaxIso}`;
+}
+
+function buildLayout(title) {
+  return {
+    title,
+    xaxis: {
+      rangeslider: { visible: true },
+      rangeselector: {
+        buttons: [
+          {count: 7, label:'7d', step:'day', stepmode:'backward'},
+          {count: 1, label:'1m', step:'month', stepmode:'backward'},
+          {count: 3, label:'3m', step:'month', stepmode:'backward'},
+          {step:'all', label:'all'}
+        ]
+      }
+    },
+    template: 'plotly_dark',
+    height: 800
+  };
+}
+
+function updateMetrics(start, end) {
+  let count = 0, wins = 0, pnl = 0, pnlPct = 0;
+  for (const tr of tradesCache) {
+    const entry = new Date(tr.entry_time);
+    const exit = new Date(tr.exit_time);
+    if (entry <= end && exit >= start) {
+      count += 1;
+      pnl += tr.pnl;
+      pnlPct += tr.pnl_pct;
+      if (tr.pnl > 0) wins += 1;
+    }
+  }
+  const losses = count - wins;
+  const winrate = count > 0 ? (wins / count * 100).toFixed(2) : '0.00';
+  metricsEl.textContent = `Rango: ${start.toISOString()} → ${end.toISOString()} | Trades: ${count} | Wins: ${wins} | Losses: ${losses} | Winrate: ${winrate}% | PnL: ${pnl.toFixed(2)} | PnL%: ${(pnlPct*100).toFixed(2)}%`;
+}
+
+async function runBacktest() {
+  const startRaw = document.getElementById('start').value || defaultRangeMin;
+  const endRaw = document.getElementById('end').value || defaultRangeMax;
+  const startVal = startRaw ? `${startRaw}T00:00:00-03:00` : null;
+  const endVal = endRaw ? `${endRaw}T23:59:59-03:00` : null;
+  const payload = {
+    strategy: document.getElementById('strategy').value,
+    tf: document.getElementById('tf').value,
+    entry: document.getElementById('entry').value,
+    sl: parseFloat(document.getElementById('sl').value),
+    tp: parseFloat(document.getElementById('tp').value),
+    notional: parseFloat(document.getElementById('notional').value),
+    fee: parseFloat(document.getElementById('fee').value),
+    start: startVal,
+    end: endVal,
+  };
+  metricsEl.textContent = 'Ejecutando...';
+  runBtnEl.disabled = true;
+  progressWrapEl.style.display = 'block';
+  progressBarEl.value = 0;
+  progressTextEl.textContent = 'Iniciando...';
+
+  const res = await fetch('/api/run_async', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  });
+  const runStart = await res.json();
+  if (!runStart.ok) {
+    runBtnEl.disabled = false;
+    progressWrapEl.style.display = 'none';
+    metricsEl.textContent = 'Error: ' + runStart.error;
+    return;
+  }
+  const jobId = runStart.job_id;
+
+  if (activePoll) {
+    clearInterval(activePoll);
+    activePoll = null;
+  }
+
+  const done = await new Promise((resolve) => {
+    activePoll = setInterval(async () => {
+      try {
+        const statusRes = await fetch(`/api/run_status/${jobId}`);
+        const statusData = await statusRes.json();
+        if (!statusData.ok) {
+          clearInterval(activePoll);
+          activePoll = null;
+          resolve({ok:false, error: statusData.error || 'Fallo consultando estado'});
+          return;
+        }
+        progressBarEl.value = Math.max(0, Math.min(100, statusData.progress || 0));
+        progressTextEl.textContent = `${Math.round(statusData.progress || 0)}% - ${statusData.message || 'Procesando'}`;
+        if (statusData.status === 'done') {
+          clearInterval(activePoll);
+          activePoll = null;
+          resolve(statusData.result);
+        } else if (statusData.status === 'error') {
+          clearInterval(activePoll);
+          activePoll = null;
+          resolve({ok:false, error: statusData.error || statusData.message || 'Error de ejecución'});
+        }
+      } catch (err) {
+        clearInterval(activePoll);
+        activePoll = null;
+        resolve({ok:false, error:String(err)});
+      }
+    }, 500);
+  });
+
+  progressWrapEl.style.display = 'none';
+  runBtnEl.disabled = false;
+  const data = done;
+  if (!data || !data.ok) {
+    metricsEl.textContent = 'Error: ' + (data && data.error ? data.error : 'Error desconocido');
+    return;
+  }
+  const o = data.ohlcv;
+  const traces = [
+    {
+      type: 'candlestick',
+      x: o.t, open: o.open, high: o.high, low: o.low, close: o.close,
+      name: 'OHLC'
+    }
+  ];
+  for (const ov of data.overlays) {
+    traces.push({ type: 'scatter', mode:'lines', x: ov.t, y: ov.v, name: ov.name });
+  }
+  for (const m of data.markers) {
+    const color = m.type.includes('entry_long') ? 'green' : m.type.includes('entry_short') ? 'red' : 'orange';
+    traces.push({ type: 'scatter', mode:'markers', x:[m.t], y:[m.price], marker:{size:6, color}, name: m.type, showlegend:false });
+  }
+  const layout = buildLayout(`${payload.strategy} | tf=${payload.tf} | entry=${payload.entry}`);
+  layout.xaxis.range = [o.t[0], o.t[o.t.length-1]];
+  Plotly.newPlot(chartEl, traces, layout);
+  tradesCache = data.trades;
+  latestRange = [o.t[0], o.t[o.t.length-1]];
+  const tmin = new Date(o.t[0]);
+  const tmax = new Date(o.t[o.t.length-1]);
+  updateMetrics(tmin, tmax);
+
+  chartEl.on('plotly_relayout', (evt) => {
+    const r0 = evt['xaxis.range[0]'];
+    const r1 = evt['xaxis.range[1]'];
+    if (r0 && r1) {
+      updateMetrics(new Date(r0), new Date(r1));
+    }
+  });
+}
+
+function applyDefaults() {
+  if (!defaultsByStrategy) return;
+  const strat = document.getElementById('strategy').value;
+  const def = defaultsByStrategy[strat];
+  if (!def) return;
+  if (typeof def.sl === 'number') document.getElementById('sl').value = def.sl;
+  if (typeof def.tp === 'number') document.getElementById('tp').value = def.tp;
+}
+
+// events
+
+document.getElementById('file').addEventListener('change', loadParquet);
+document.getElementById('run').addEventListener('click', runBacktest);
+document.getElementById('strategy').addEventListener('change', applyDefaults);
+document.getElementById('goto-latest').addEventListener('click', () => {
+  if (!latestRange) return;
+  Plotly.relayout(chartEl, {'xaxis.range': latestRange});
+  updateMetrics(new Date(latestRange[0]), new Date(latestRange[1]));
+});
+</script>
+</body>
+</html>

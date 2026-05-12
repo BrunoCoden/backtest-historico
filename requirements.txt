@@ -1,0 +1,7 @@
+requests
+pyarrow
+pandas
+plotly
+fastapi
+uvicorn
+python-multipart
