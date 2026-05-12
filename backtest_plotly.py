@@ -432,6 +432,7 @@ def run_range3_bb_backtest(
     stop_loss_pct: float = 0.02,
     use_opposite_take_profit: bool = False,
     entry_mode: str = "next_open",
+    intrabar_ohlcv: Optional[pd.DataFrame] = None,
 ) -> tuple[list[Trade], list[dict], pd.DataFrame, pd.DataFrame]:
     channels = compute_range3_channels(ohlcv, lookback_bars, pct_upper, pct_middle, pct_lower)
     bb = compute_bollinger_bands(ohlcv, bb_length, bb_mult, profile="tradingview")
@@ -453,6 +454,33 @@ def run_range3_bb_backtest(
     minroof = channels["minroof"].to_numpy(dtype="float64")
     min_line = channels["min"].to_numpy(dtype="float64")
     range_size = channels["range"].to_numpy(dtype="float64")
+
+    intrabar_enabled = bool(intrabar_ohlcv is not None and not intrabar_ohlcv.empty)
+    ib_index = None
+    ib_low = None
+    ib_high = None
+    bar_start_pos = None
+    bar_end_pos = None
+    if intrabar_enabled:
+        ib = intrabar_ohlcv[["High", "Low"]].copy().sort_index()
+        ib_index = ib.index
+        ib_ns = ib_index.view("i8")
+        ib_low = ib["Low"].to_numpy(dtype="float64")
+        ib_high = ib["High"].to_numpy(dtype="float64")
+
+        bar_ns = ohlcv.index.view("i8")
+        if len(bar_ns) >= 2:
+            diffs = np.diff(bar_ns)
+            step_ns = int(np.median(diffs[diffs > 0])) if np.any(diffs > 0) else int(pd.Timedelta(minutes=1).value)
+        else:
+            step_ns = int(pd.Timedelta(minutes=1).value)
+        next_bar_ns = np.empty_like(bar_ns)
+        if len(bar_ns) >= 2:
+            next_bar_ns[:-1] = bar_ns[1:]
+        if len(bar_ns) >= 1:
+            next_bar_ns[-1] = bar_ns[-1] + step_ns
+        bar_start_pos = np.searchsorted(ib_ns, bar_ns, side="left")
+        bar_end_pos = np.searchsorted(ib_ns, next_bar_ns, side="left")
 
     def close_position(exit_price: float, ts: pd.Timestamp, reason: str):
         nonlocal position
@@ -496,14 +524,48 @@ def run_range3_bb_backtest(
         )
         markers.append({"ts": ts, "price": price, "type": f"entry_{direction}"})
 
-    def pending_hit(po: PendingRangeOrder, i: int) -> bool:
+    def pending_hit(po: PendingRangeOrder, hi: float, lo: float) -> bool:
         if po.side == 1:
-            return high[i] >= po.price if po.order_type == "Stop en banda" else low[i] <= po.price
-        return low[i] <= po.price if po.order_type == "Stop en banda" else high[i] >= po.price
+            return hi >= po.price if po.order_type == "Stop en banda" else lo <= po.price
+        return lo <= po.price if po.order_type == "Stop en banda" else hi >= po.price
 
     def cancel_pending():
         nonlocal pending_order
         pending_order = None
+
+    def evaluate_execution_path(i: int, hi: float, lo: float, event_ts: pd.Timestamp, allow_pending_fill: bool):
+        nonlocal pending_order
+        if pending_order is not None and allow_pending_fill and i > pending_order.bar_i and pending_hit(pending_order, hi, lo):
+            side = pending_order.side
+            price = pending_order.price
+            reason = "range3_pending_long" if side == 1 else "range3_pending_short"
+            markers.append({"ts": event_ts, "price": price, "type": "pending_fill_long" if side == 1 else "pending_fill_short"})
+            pending_order = None
+            open_position("long" if side == 1 else "short", price, event_ts, reason)
+
+        if position is None:
+            return
+
+        exit_price = None
+        reason = ""
+        if use_stop_loss_pct and position.sl_price is not None:
+            if position.direction == "long" and lo <= position.sl_price:
+                exit_price = position.sl_price
+                reason = "stop_loss"
+            elif position.direction == "short" and hi >= position.sl_price:
+                exit_price = position.sl_price
+                reason = "stop_loss"
+
+        if exit_price is None and use_opposite_take_profit and not np.isnan(maxfloor[i]) and not np.isnan(minroof[i]):
+            if position.direction == "long" and hi >= maxfloor[i]:
+                exit_price = maxfloor[i]
+                reason = "tp_opposite_zone"
+            elif position.direction == "short" and lo <= minroof[i]:
+                exit_price = minroof[i]
+                reason = "tp_opposite_zone"
+
+        if exit_price is not None:
+            close_position(float(exit_price), event_ts, reason)
 
     for i in range(len(ohlcv)):
         ts = idx[i]
@@ -513,37 +575,17 @@ def run_range3_bb_backtest(
             open_position(pending_market.direction, o, ts, pending_market.reason)
             pending_market = None
 
-        if pending_order is not None and i > pending_order.bar_i and pending_hit(pending_order, i):
-            side = pending_order.side
-            price = pending_order.price
-            reason = "range3_pending_long" if side == 1 else "range3_pending_short"
-            markers.append({"ts": ts, "price": price, "type": "pending_fill_long" if side == 1 else "pending_fill_short"})
-            pending_order = None
-            open_position("long" if side == 1 else "short", price, ts, reason)
+        used_intrabar = False
+        if intrabar_enabled and ib_index is not None and ib_low is not None and ib_high is not None:
+            s = int(bar_start_pos[i])
+            e = int(bar_end_pos[i])
+            if e > s:
+                used_intrabar = True
+                for j in range(s, e):
+                    evaluate_execution_path(i, float(ib_high[j]), float(ib_low[j]), ib_index[j], allow_pending_fill=True)
 
-        if position is not None:
-            hit_sl = False
-            exit_price = None
-            reason = ""
-            if use_stop_loss_pct and position.sl_price is not None:
-                if position.direction == "long" and l <= position.sl_price:
-                    hit_sl = True
-                elif position.direction == "short" and h >= position.sl_price:
-                    hit_sl = True
-                if hit_sl:
-                    exit_price = position.sl_price
-                    reason = "stop_loss"
-
-            if not hit_sl and use_opposite_take_profit and not np.isnan(maxfloor[i]) and not np.isnan(minroof[i]):
-                if position.direction == "long" and h >= maxfloor[i]:
-                    exit_price = maxfloor[i]
-                    reason = "tp_opposite_zone"
-                elif position.direction == "short" and l <= minroof[i]:
-                    exit_price = minroof[i]
-                    reason = "tp_opposite_zone"
-
-            if exit_price is not None:
-                close_position(float(exit_price), ts, reason)
+        if not used_intrabar:
+            evaluate_execution_path(i, h, l, ts, allow_pending_fill=True)
 
         if np.isnan(range_size[i]) or range_size[i] <= 0:
             continue
@@ -853,6 +895,16 @@ def main() -> int:
     parser.add_argument("--out", default="plot.html", help="Salida HTML")
     parser.add_argument("--out-trades", default="trades.csv", help="CSV de trades")
     parser.add_argument("--tz", default="America/Argentina/Buenos_Aires", help="Timezone")
+    parser.add_argument(
+        "--intrabar-parquet",
+        default="",
+        help="Parquet intrabar opcional para ejecucion tick/1s dentro de cada vela principal",
+    )
+    parser.add_argument(
+        "--intrabar-tf",
+        default="1s",
+        help="Timeframe para resamplear el parquet intrabar (ej: 1s, 5s, 1min)",
+    )
     parser.add_argument("--bb-length", type=int, default=20)
     parser.add_argument("--bb-mult", type=float, default=2.0)
     parser.add_argument("--bb-profile", choices=["tradingview", "legacy"], default="tradingview")
@@ -904,6 +956,22 @@ def main() -> int:
     if ohlcv.empty:
         print("No hay datos en el rango seleccionado.", file=sys.stderr)
         return 1
+
+    intrabar_ohlcv = None
+    if args.intrabar_parquet:
+        ib_path = Path(args.intrabar_parquet)
+        if not ib_path.exists():
+            print(f"No existe intrabar parquet: {ib_path}", file=sys.stderr)
+            return 1
+        df_intrabar = pd.read_parquet(ib_path)
+        intrabar_ohlcv = _resample_ohlcv(df_intrabar, args.intrabar_tf, args.tz)
+        if args.start:
+            intrabar_ohlcv = intrabar_ohlcv[intrabar_ohlcv.index >= pd.Timestamp(args.start)]
+        if args.end:
+            intrabar_ohlcv = intrabar_ohlcv[intrabar_ohlcv.index <= pd.Timestamp(args.end)]
+        if intrabar_ohlcv.empty:
+            print("No hay datos intrabar en el rango seleccionado.", file=sys.stderr)
+            return 1
 
     # build signals + overlays
     overlays = []
@@ -957,6 +1025,7 @@ def main() -> int:
             stop_loss_pct=args.sl,
             use_opposite_take_profit=args.range_use_opposite_tp,
             entry_mode=args.entry,
+            intrabar_ohlcv=intrabar_ohlcv,
         )
         overlays.extend(
             [

@@ -86,6 +86,19 @@ python backtest_plotly.py data/generated_2026/ETHUSDT_2026_ytd_30m_ohlc.parquet 
   --out-trades data/generated_2026/range3_bb_eth_30m_2026_trades.csv
 ```
 
+Para resolver ordenes pendientes, SL y TP dentro de cada vela con datos mas finos:
+```bash
+python backtest_plotly.py data/generated_2026/ETHUSDT_2026_ytd_30m_ohlc.parquet \
+  --strategy range3_bb \
+  --tf 30min \
+  --intrabar-parquet data/generated_2026/ETHUSDT_2026_ytd_1s_ohlc.parquet \
+  --intrabar-tf 1s \
+  --entry next_open \
+  --notional 1000 \
+  --fee 0.0004 \
+  --sl 0.02
+```
+
 Parametros principales:
 - `--range-lookback` default `200`
 - `--range-pct-upper / --range-pct-middle / --range-pct-lower` default `25/50/25`
@@ -93,3 +106,4 @@ Parametros principales:
 - `--range-pending-order-type`: `"Stop en banda"` o `"Limit en banda"`
 - `--range-new-extreme-bars` default `3`
 - `--range-use-opposite-tp` activa el TP por zona opuesta
+- `--intrabar-parquet` permite usar datos `1s`, `5s` o trades agregados para ejecutar dentro de la vela principal
