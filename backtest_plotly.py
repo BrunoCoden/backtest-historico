@@ -1134,6 +1134,7 @@ def main() -> int:
     parser.add_argument("--range-update-pending-every-bar", action="store_true")
     parser.add_argument("--range-disable-sl", action="store_true")
     parser.add_argument("--range-use-opposite-tp", action="store_true")
+    parser.add_argument("--range-extremes-disable-tp", action="store_true")
     args = parser.parse_args()
 
     p = Path(args.parquet_path)
@@ -1245,7 +1246,7 @@ def main() -> int:
             replace_pending_opposite=not args.range_keep_opposite_pending,
             use_stop_loss_pct=not args.range_disable_sl,
             stop_loss_pct=args.sl,
-            take_profit_pct=args.tp if args.tp > 0 else 0.05,
+            take_profit_pct=0.0 if args.range_extremes_disable_tp else (args.tp if args.tp > 0 else 0.05),
             intrabar_ohlcv=intrabar_ohlcv,
         )
         overlays.extend(
