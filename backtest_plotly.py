@@ -867,8 +867,14 @@ def run_range3_bb_lock_backtest(
         # Si hay una pendiente y aparece señal opuesta, se descarta.
         if pending_order is not None:
             if pending_order.side == side:
-                pending_order = None
-                open_position("long" if side == 1 else "short", c, signal_ts, "range3_consecutive_close")
+                if recent_extreme:
+                    price = float(minroof[i]) if side == 1 else float(maxfloor[i])
+                    if not np.isnan(price) and price > 0:
+                        pending_order = PendingRangeOrder(side=side, price=price, bar_i=i, order_type=pending_order_type)
+                        markers.append({"ts": signal_ts, "price": price, "type": "pending_set_long" if side == 1 else "pending_set_short"})
+                else:
+                    pending_order = None
+                    open_position("long" if side == 1 else "short", c, signal_ts, "range3_consecutive_close")
             continue
 
         if position is not None:
