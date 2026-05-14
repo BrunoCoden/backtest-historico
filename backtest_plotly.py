@@ -815,9 +815,19 @@ def run_range3_bb_lock_backtest(
         ref_long = low[i] if classify_with == "Mecha" else close[i]
         in_short_zone = ref_short <= max_line[i] and ref_short >= maxfloor[i]
         in_long_zone = ref_long >= min_line[i] and ref_long <= minroof[i]
+        close_in_short_zone = close[i] <= max_line[i] and close[i] >= maxfloor[i]
+        close_in_long_zone = close[i] >= min_line[i] and close[i] <= minroof[i]
         ambiguous = bool(bb_sig[i] and in_short_zone and in_long_zone)
-        short_signal = bool(upper_sig[i] and ((in_short_zone and not in_long_zone) or (ambiguous and ambiguous_priority == "Priorizar SHORT")))
-        long_signal = bool(lower_sig[i] and ((in_long_zone and not in_short_zone) or (ambiguous and ambiguous_priority == "Priorizar LONG")))
+        short_signal = bool(
+            upper_sig[i]
+            and close_in_short_zone
+            and ((in_short_zone and not in_long_zone) or (ambiguous and ambiguous_priority == "Priorizar SHORT"))
+        )
+        long_signal = bool(
+            lower_sig[i]
+            and close_in_long_zone
+            and ((in_long_zone and not in_short_zone) or (ambiguous and ambiguous_priority == "Priorizar LONG"))
+        )
         if long_signal and not short_signal:
             return 1
         if short_signal and not long_signal:
