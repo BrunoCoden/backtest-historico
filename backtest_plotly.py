@@ -674,6 +674,8 @@ def run_range3_bb_lock_backtest(
     profit_lock_trigger_pct: float = 0.03,
     profit_lock_sl_pct: float = 0.005,
     intrabar_ohlcv: Optional[pd.DataFrame] = None,
+    active_start: Optional[pd.Timestamp] = None,
+    active_end: Optional[pd.Timestamp] = None,
 ) -> tuple[list[Trade], list[dict], pd.DataFrame, pd.DataFrame]:
     channels = compute_range3_channels(ohlcv, lookback_bars, pct_upper, pct_middle, pct_lower)
     bb = compute_bollinger_bands(ohlcv, bb_length, bb_mult, profile="tradingview")
@@ -814,8 +816,8 @@ def run_range3_bb_lock_backtest(
         in_short_zone = ref_short <= max_line[i] and ref_short >= maxfloor[i]
         in_long_zone = ref_long >= min_line[i] and ref_long <= minroof[i]
         ambiguous = bool(bb_sig[i] and in_short_zone and in_long_zone)
-        short_signal = bool(bb_sig[i] and ((in_short_zone and not in_long_zone) or (ambiguous and ambiguous_priority == "Priorizar SHORT")))
-        long_signal = bool(bb_sig[i] and ((in_long_zone and not in_short_zone) or (ambiguous and ambiguous_priority == "Priorizar LONG")))
+        short_signal = bool(upper_sig[i] and ((in_short_zone and not in_long_zone) or (ambiguous and ambiguous_priority == "Priorizar SHORT")))
+        long_signal = bool(lower_sig[i] and ((in_long_zone and not in_short_zone) or (ambiguous and ambiguous_priority == "Priorizar LONG")))
         if long_signal and not short_signal:
             return 1
         if short_signal and not long_signal:
@@ -842,6 +844,10 @@ def run_range3_bb_lock_backtest(
         if side == 0:
             continue
         signal_ts = signal_idx[i]
+        if active_start is not None and signal_ts < active_start:
+            continue
+        if active_end is not None and signal_ts > active_end:
+            continue
 
         # Si hay una pendiente y aparece señal opuesta, se descarta.
         if pending_order is not None:
@@ -1365,10 +1371,16 @@ def main() -> int:
 
     df_ticks = pd.read_parquet(p)
     ohlcv = _resample_ohlcv(df_ticks, args.tf, args.tz)
-    if args.start:
-        ohlcv = ohlcv[ohlcv.index >= pd.Timestamp(args.start)]
-    if args.end:
-        ohlcv = ohlcv[ohlcv.index <= pd.Timestamp(args.end)]
+    start_ts = pd.Timestamp(args.start) if args.start else None
+    end_ts = pd.Timestamp(args.end) if args.end else None
+    if args.strategy == "range3_bb_lock" and start_ts is not None:
+        warmup_bars = max(args.range_lookback + args.bb_length + args.range_new_extreme_bars + 20, 260)
+        warmup_start = start_ts - pd.tseries.frequencies.to_offset(_normalize_rule(args.tf)) * warmup_bars
+        ohlcv = ohlcv[ohlcv.index >= warmup_start]
+    elif start_ts is not None:
+        ohlcv = ohlcv[ohlcv.index >= start_ts]
+    if end_ts is not None:
+        ohlcv = ohlcv[ohlcv.index <= end_ts]
     if ohlcv.empty:
         print("No hay datos en el rango seleccionado.", file=sys.stderr)
         return 1
@@ -1475,6 +1487,8 @@ def main() -> int:
             profit_lock_trigger_pct=args.profit_lock_trigger,
             profit_lock_sl_pct=args.profit_lock_sl,
             intrabar_ohlcv=intrabar_ohlcv,
+            active_start=start_ts,
+            active_end=end_ts,
         )
         overlays.extend(
             [
