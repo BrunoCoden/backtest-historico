@@ -153,6 +153,7 @@ class Position:
     sl_price: Optional[float]
     tp_price: Optional[float]
     entry_reason: str
+    profit_lock_done: bool = False
 
 
 @dataclass
@@ -653,6 +654,224 @@ def run_range3_bb_backtest(
     return trades, markers, channels, bb
 
 
+def run_range3_bb_lock_backtest(
+    ohlcv: pd.DataFrame,
+    notional: float,
+    fee_rate: float,
+    lookback_bars: int = 200,
+    pct_upper: float = 25.0,
+    pct_middle: float = 50.0,
+    pct_lower: float = 25.0,
+    bb_length: int = 20,
+    bb_mult: float = 2.0,
+    signal_type: str = "Mecha + cierre",
+    avoid_repeated: bool = True,
+    classify_with: str = "Mecha",
+    ambiguous_priority: str = "Ignorar",
+    previous_extreme_bars: int = 3,
+    pending_order_type: str = "Stop en banda",
+    stop_loss_pct: float = 0.02,
+    profit_lock_trigger_pct: float = 0.03,
+    profit_lock_sl_pct: float = 0.005,
+    intrabar_ohlcv: Optional[pd.DataFrame] = None,
+) -> tuple[list[Trade], list[dict], pd.DataFrame, pd.DataFrame]:
+    channels = compute_range3_channels(ohlcv, lookback_bars, pct_upper, pct_middle, pct_lower)
+    bb = compute_bollinger_bands(ohlcv, bb_length, bb_mult, profile="tradingview")
+    lower_sig, upper_sig, bb_sig = _range3_bb_raw_signals(ohlcv, bb, signal_type, avoid_repeated)
+
+    trades: list[Trade] = []
+    markers: list[dict] = []
+    position: Optional[Position] = None
+    pending_order: Optional[PendingRangeOrder] = None
+
+    high = ohlcv["High"].to_numpy(dtype="float64")
+    low = ohlcv["Low"].to_numpy(dtype="float64")
+    close = ohlcv["Close"].to_numpy(dtype="float64")
+    idx = ohlcv.index
+    if len(idx) >= 2:
+        idx_diffs = idx.to_series().diff().dropna()
+        idx_step = idx_diffs.median() if not idx_diffs.empty else pd.Timedelta(minutes=1)
+    else:
+        idx_step = pd.Timedelta(minutes=1)
+    signal_idx = list(idx[1:]) + ([idx[-1] + idx_step] if len(idx) else [])
+    max_line = channels["max"].to_numpy(dtype="float64")
+    maxfloor = channels["maxfloor"].to_numpy(dtype="float64")
+    minroof = channels["minroof"].to_numpy(dtype="float64")
+    min_line = channels["min"].to_numpy(dtype="float64")
+    range_size = channels["range"].to_numpy(dtype="float64")
+
+    intrabar_enabled = bool(intrabar_ohlcv is not None and not intrabar_ohlcv.empty)
+    ib_index = None
+    ib_low = None
+    ib_high = None
+    bar_start_pos = None
+    bar_end_pos = None
+    if intrabar_enabled:
+        ib = intrabar_ohlcv[["High", "Low"]].copy().sort_index()
+        ib_index = ib.index
+        ib_ns = ib_index.view("i8")
+        ib_low = ib["Low"].to_numpy(dtype="float64")
+        ib_high = ib["High"].to_numpy(dtype="float64")
+
+        bar_ns = ohlcv.index.view("i8")
+        if len(bar_ns) >= 2:
+            diffs = np.diff(bar_ns)
+            step_ns = int(np.median(diffs[diffs > 0])) if np.any(diffs > 0) else int(pd.Timedelta(minutes=1).value)
+        else:
+            step_ns = int(pd.Timedelta(minutes=1).value)
+        next_bar_ns = np.empty_like(bar_ns)
+        if len(bar_ns) >= 2:
+            next_bar_ns[:-1] = bar_ns[1:]
+        if len(bar_ns) >= 1:
+            next_bar_ns[-1] = bar_ns[-1] + step_ns
+        bar_start_pos = np.searchsorted(ib_ns, bar_ns, side="left")
+        bar_end_pos = np.searchsorted(ib_ns, next_bar_ns, side="left")
+
+    def close_position(exit_price: float, ts: pd.Timestamp, reason: str):
+        nonlocal position
+        if position is None:
+            return
+        pnl, pnl_pct = _calc_pnl(position.direction, position.entry_price, exit_price, notional, fee_rate)
+        trades.append(
+            Trade(
+                entry_time=position.entry_time,
+                exit_time=ts,
+                direction=position.direction,
+                entry_price=position.entry_price,
+                exit_price=exit_price,
+                entry_reason=position.entry_reason,
+                exit_reason=reason,
+                pnl=pnl,
+                pnl_pct=pnl_pct,
+            )
+        )
+        markers.append({"ts": ts, "price": exit_price, "type": f"exit_{position.direction}"})
+        position = None
+
+    def open_position(direction: str, price: float, ts: pd.Timestamp, reason: str):
+        nonlocal position
+        if price <= 0:
+            return
+        if position is not None:
+            if position.direction == direction:
+                return
+            close_position(price, ts, "reverse_signal")
+        sl = price * (1 - stop_loss_pct) if direction == "long" else price * (1 + stop_loss_pct)
+        position = Position(
+            direction=direction,
+            entry_price=price,
+            entry_time=ts,
+            sl_price=sl,
+            tp_price=None,
+            entry_reason=reason,
+            profit_lock_done=False,
+        )
+        markers.append({"ts": ts, "price": price, "type": f"entry_{direction}"})
+
+    def pending_hit(po: PendingRangeOrder, hi: float, lo: float) -> bool:
+        if po.side == 1:
+            return hi >= po.price if po.order_type == "Stop en banda" else lo <= po.price
+        return lo <= po.price if po.order_type == "Stop en banda" else hi >= po.price
+
+    def evaluate_execution_path(i: int, hi: float, lo: float, event_ts: pd.Timestamp, allow_pending_fill: bool):
+        nonlocal pending_order, position
+        if pending_order is not None and allow_pending_fill and i > pending_order.bar_i and pending_hit(pending_order, hi, lo):
+            side = pending_order.side
+            price = pending_order.price
+            reason = "range3_pending_long" if side == 1 else "range3_pending_short"
+            markers.append({"ts": event_ts, "price": price, "type": "pending_fill_long" if side == 1 else "pending_fill_short"})
+            pending_order = None
+            open_position("long" if side == 1 else "short", price, event_ts, reason)
+
+        if position is None:
+            return
+
+        if not position.profit_lock_done:
+            if position.direction == "long" and hi >= position.entry_price * (1 + profit_lock_trigger_pct):
+                position.sl_price = position.entry_price * (1 + profit_lock_sl_pct)
+                position.profit_lock_done = True
+                markers.append({"ts": event_ts, "price": position.sl_price, "type": "profit_lock_long"})
+            elif position.direction == "short" and lo <= position.entry_price * (1 - profit_lock_trigger_pct):
+                position.sl_price = position.entry_price * (1 - profit_lock_sl_pct)
+                position.profit_lock_done = True
+                markers.append({"ts": event_ts, "price": position.sl_price, "type": "profit_lock_short"})
+
+        if position.sl_price is None:
+            return
+
+        if position.direction == "long" and lo <= position.sl_price:
+            reason = "profit_lock_sl" if position.profit_lock_done else "stop_loss"
+            close_position(float(position.sl_price), event_ts, reason)
+        elif position.direction == "short" and hi >= position.sl_price:
+            reason = "profit_lock_sl" if position.profit_lock_done else "stop_loss"
+            close_position(float(position.sl_price), event_ts, reason)
+
+    def valid_signal(i: int) -> int:
+        if np.isnan(range_size[i]) or range_size[i] <= 0:
+            return 0
+        ref_short = high[i] if classify_with == "Mecha" else close[i]
+        ref_long = low[i] if classify_with == "Mecha" else close[i]
+        in_short_zone = ref_short <= max_line[i] and ref_short >= maxfloor[i]
+        in_long_zone = ref_long >= min_line[i] and ref_long <= minroof[i]
+        ambiguous = bool(bb_sig[i] and in_short_zone and in_long_zone)
+        short_signal = bool(bb_sig[i] and ((in_short_zone and not in_long_zone) or (ambiguous and ambiguous_priority == "Priorizar SHORT")))
+        long_signal = bool(bb_sig[i] and ((in_long_zone and not in_short_zone) or (ambiguous and ambiguous_priority == "Priorizar LONG")))
+        if long_signal and not short_signal:
+            return 1
+        if short_signal and not long_signal:
+            return -1
+        return 0
+
+    for i in range(len(ohlcv)):
+        ts = idx[i]
+        h, l, c = high[i], low[i], close[i]
+
+        used_intrabar = False
+        if intrabar_enabled and ib_index is not None and ib_low is not None and ib_high is not None:
+            s = int(bar_start_pos[i])
+            e = int(bar_end_pos[i])
+            if e > s:
+                used_intrabar = True
+                for j in range(s, e):
+                    evaluate_execution_path(i, float(ib_high[j]), float(ib_low[j]), ib_index[j], allow_pending_fill=True)
+
+        if not used_intrabar:
+            evaluate_execution_path(i, h, l, ts, allow_pending_fill=True)
+
+        side = valid_signal(i)
+        if side == 0:
+            continue
+        signal_ts = signal_idx[i]
+
+        # Si hay una pendiente y aparece señal opuesta, se descarta.
+        if pending_order is not None:
+            if pending_order.side == side:
+                pending_order = None
+                open_position("long" if side == 1 else "short", c, signal_ts, "range3_consecutive_close")
+            continue
+
+        if position is not None:
+            current_side = 1 if position.direction == "long" else -1
+            if side != current_side:
+                open_position("long" if side == 1 else "short", c, signal_ts, "range3_reverse_signal")
+            continue
+
+        start_i = max(0, i - max(0, int(previous_extreme_bars)))
+        recent_max = bool(np.any(high[start_i : i + 1] >= max_line[start_i : i + 1]))
+        recent_min = bool(np.any(low[start_i : i + 1] <= min_line[start_i : i + 1]))
+        recent_extreme = recent_max or recent_min
+
+        if recent_extreme:
+            price = float(minroof[i]) if side == 1 else float(maxfloor[i])
+            if not np.isnan(price) and price > 0:
+                pending_order = PendingRangeOrder(side=side, price=price, bar_i=i, order_type=pending_order_type)
+                markers.append({"ts": signal_ts, "price": price, "type": "pending_set_long" if side == 1 else "pending_set_short"})
+        else:
+            open_position("long" if side == 1 else "short", c, signal_ts, "range3_direct_close")
+
+    return trades, markers, channels, bb
+
+
 def run_range3_extremes_backtest(
     ohlcv: pd.DataFrame,
     notional: float,
@@ -1077,7 +1296,7 @@ def main() -> int:
     parser.add_argument(
         "--strategy",
         required=True,
-        choices=["bollinger", "supertrend", "supertrend2", "range3_bb", "range3_extremes"],
+        choices=["bollinger", "supertrend", "supertrend2", "range3_bb", "range3_extremes", "range3_bb_lock"],
         help="Estrategia",
     )
     parser.add_argument("--tf", default="30T", help="Timeframe (ej: 30T, 1H)")
@@ -1135,6 +1354,8 @@ def main() -> int:
     parser.add_argument("--range-disable-sl", action="store_true")
     parser.add_argument("--range-use-opposite-tp", action="store_true")
     parser.add_argument("--range-extremes-disable-tp", action="store_true")
+    parser.add_argument("--profit-lock-trigger", type=float, default=0.03)
+    parser.add_argument("--profit-lock-sl", type=float, default=0.005)
     args = parser.parse_args()
 
     p = Path(args.parquet_path)
@@ -1220,6 +1441,39 @@ def main() -> int:
             stop_loss_pct=args.sl,
             use_opposite_take_profit=args.range_use_opposite_tp,
             entry_mode=args.entry,
+            intrabar_ohlcv=intrabar_ohlcv,
+        )
+        overlays.extend(
+            [
+                ("range_max", channels["max"]),
+                ("range_maxfloor", channels["maxfloor"]),
+                ("range_minroof", channels["minroof"]),
+                ("range_min", channels["min"]),
+                ("bb_upper", bb["upper"]),
+                ("bb_lower", bb["lower"]),
+                ("bb_basis", bb["basis"]),
+            ]
+        )
+    elif args.strategy == "range3_bb_lock":
+        trades, markers, channels, bb = run_range3_bb_lock_backtest(
+            ohlcv=ohlcv,
+            notional=args.notional,
+            fee_rate=args.fee,
+            lookback_bars=args.range_lookback,
+            pct_upper=args.range_pct_upper,
+            pct_middle=args.range_pct_middle,
+            pct_lower=args.range_pct_lower,
+            bb_length=args.bb_length,
+            bb_mult=args.bb_mult,
+            signal_type=args.range_bb_signal_type,
+            avoid_repeated=not args.range_allow_repeated_bb,
+            classify_with=args.range_classify_with,
+            ambiguous_priority=args.range_ambiguous_priority,
+            previous_extreme_bars=args.range_new_extreme_bars,
+            pending_order_type=args.range_pending_order_type,
+            stop_loss_pct=args.sl,
+            profit_lock_trigger_pct=args.profit_lock_trigger,
+            profit_lock_sl_pct=args.profit_lock_sl,
             intrabar_ohlcv=intrabar_ohlcv,
         )
         overlays.extend(
