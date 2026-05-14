@@ -859,6 +859,11 @@ def run_range3_bb_lock_backtest(
         if active_end is not None and signal_ts > active_end:
             continue
 
+        start_i = max(0, i - max(0, int(previous_extreme_bars)))
+        recent_max = bool(np.any(high[start_i : i + 1] >= max_line[start_i : i + 1]))
+        recent_min = bool(np.any(low[start_i : i + 1] <= min_line[start_i : i + 1]))
+        recent_extreme = recent_max or recent_min
+
         # Si hay una pendiente y aparece señal opuesta, se descarta.
         if pending_order is not None:
             if pending_order.side == side:
@@ -869,13 +874,14 @@ def run_range3_bb_lock_backtest(
         if position is not None:
             current_side = 1 if position.direction == "long" else -1
             if side != current_side:
-                open_position("long" if side == 1 else "short", c, signal_ts, "range3_reverse_signal")
+                if recent_extreme:
+                    price = float(minroof[i]) if side == 1 else float(maxfloor[i])
+                    if not np.isnan(price) and price > 0:
+                        pending_order = PendingRangeOrder(side=side, price=price, bar_i=i, order_type=pending_order_type)
+                        markers.append({"ts": signal_ts, "price": price, "type": "pending_set_long" if side == 1 else "pending_set_short"})
+                else:
+                    open_position("long" if side == 1 else "short", c, signal_ts, "range3_reverse_signal")
             continue
-
-        start_i = max(0, i - max(0, int(previous_extreme_bars)))
-        recent_max = bool(np.any(high[start_i : i + 1] >= max_line[start_i : i + 1]))
-        recent_min = bool(np.any(low[start_i : i + 1] <= min_line[start_i : i + 1]))
-        recent_extreme = recent_max or recent_min
 
         if recent_extreme:
             price = float(minroof[i]) if side == 1 else float(maxfloor[i])
