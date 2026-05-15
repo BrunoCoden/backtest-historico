@@ -154,6 +154,7 @@ class Position:
     tp_price: Optional[float]
     entry_reason: str
     profit_lock_done: bool = False
+    source: str = "signal"
 
 
 @dataclass
@@ -675,6 +676,8 @@ def run_range3_bb_lock_backtest(
     profit_lock_sl_pct: float = 0.005,
     use_trailing_stop: bool = False,
     trailing_step_pct: float = 0.01,
+    flip_sl_pct: float = 0.02,
+    flip_tp_pct: float = 0.02,
     intrabar_ohlcv: Optional[pd.DataFrame] = None,
     active_start: Optional[pd.Timestamp] = None,
     active_end: Optional[pd.Timestamp] = None,
@@ -731,10 +734,11 @@ def run_range3_bb_lock_backtest(
         bar_start_pos = np.searchsorted(ib_ns, bar_ns, side="left")
         bar_end_pos = np.searchsorted(ib_ns, next_bar_ns, side="left")
 
-    def close_position(exit_price: float, ts: pd.Timestamp, reason: str):
+    def close_position(exit_price: float, ts: pd.Timestamp, reason: str) -> Optional[Position]:
         nonlocal position
         if position is None:
-            return
+            return None
+        closed = position
         pnl, pnl_pct = _calc_pnl(position.direction, position.entry_price, exit_price, notional, fee_rate)
         trades.append(
             Trade(
@@ -751,8 +755,9 @@ def run_range3_bb_lock_backtest(
         )
         markers.append({"ts": ts, "price": exit_price, "type": f"exit_{position.direction}"})
         position = None
+        return closed
 
-    def open_position(direction: str, price: float, ts: pd.Timestamp, reason: str):
+    def open_position(direction: str, price: float, ts: pd.Timestamp, reason: str, source: str = "signal"):
         nonlocal position
         if price <= 0:
             return
@@ -760,15 +765,21 @@ def run_range3_bb_lock_backtest(
             if position.direction == direction:
                 return
             close_position(price, ts, "reverse_signal")
-        sl = price * (1 - stop_loss_pct) if direction == "long" else price * (1 + stop_loss_pct)
+        sl_pct = flip_sl_pct if source == "flip" else stop_loss_pct
+        tp_pct = flip_tp_pct if source == "flip" else 0.0
+        sl = price * (1 - sl_pct) if direction == "long" else price * (1 + sl_pct)
+        tp = None
+        if tp_pct > 0:
+            tp = price * (1 + tp_pct) if direction == "long" else price * (1 - tp_pct)
         position = Position(
             direction=direction,
             entry_price=price,
             entry_time=ts,
             sl_price=sl,
-            tp_price=None,
+            tp_price=tp,
             entry_reason=reason,
             profit_lock_done=False,
+            source=source,
         )
         markers.append({"ts": ts, "price": price, "type": f"entry_{direction}"})
 
@@ -790,7 +801,7 @@ def run_range3_bb_lock_backtest(
         if position is None:
             return
 
-        if use_trailing_stop:
+        if position.source != "flip" and use_trailing_stop:
             step_pct = max(float(trailing_step_pct), 1e-12)
             if not position.profit_lock_done and position.direction == "long" and hi >= position.entry_price * (1 + profit_lock_trigger_pct):
                 position.sl_price = position.entry_price * (1 + profit_lock_sl_pct)
@@ -827,12 +838,29 @@ def run_range3_bb_lock_backtest(
         if position.sl_price is None:
             return
 
+        exit_price = None
+        reason = ""
         if position.direction == "long" and lo <= position.sl_price:
-            reason = "profit_lock_sl" if position.profit_lock_done else ("trailing_stop" if use_trailing_stop else "stop_loss")
-            close_position(float(position.sl_price), event_ts, reason)
+            exit_price = float(position.sl_price)
+            reason = "flip_stop_loss" if position.source == "flip" else ("profit_lock_sl" if position.profit_lock_done else ("trailing_stop" if use_trailing_stop else "stop_loss"))
         elif position.direction == "short" and hi >= position.sl_price:
-            reason = "profit_lock_sl" if position.profit_lock_done else ("trailing_stop" if use_trailing_stop else "stop_loss")
-            close_position(float(position.sl_price), event_ts, reason)
+            exit_price = float(position.sl_price)
+            reason = "flip_stop_loss" if position.source == "flip" else ("profit_lock_sl" if position.profit_lock_done else ("trailing_stop" if use_trailing_stop else "stop_loss"))
+
+        if exit_price is None and position.source == "flip" and position.tp_price is not None:
+            if position.direction == "long" and hi >= position.tp_price:
+                exit_price = float(position.tp_price)
+                reason = "flip_take_profit"
+            elif position.direction == "short" and lo <= position.tp_price:
+                exit_price = float(position.tp_price)
+                reason = "flip_take_profit"
+
+        if exit_price is not None:
+            should_flip = position.source == "signal" and reason in {"stop_loss", "trailing_stop", "profit_lock_sl"}
+            flip_direction = "short" if position.direction == "long" else "long"
+            closed = close_position(exit_price, event_ts, reason)
+            if should_flip and closed is not None:
+                open_position(flip_direction, exit_price, event_ts, "flip_after_sl", source="flip")
 
     def valid_signal(i: int) -> int:
         if np.isnan(range_size[i]) or range_size[i] <= 0:
@@ -917,6 +945,17 @@ def run_range3_bb_lock_backtest(
             continue
 
         if position is not None:
+            if position.source == "flip":
+                close_position(c, signal_ts, "signal_close_flip")
+                if recent_extreme:
+                    price = float(minroof[i]) if side == 1 else float(maxfloor[i])
+                    if not np.isnan(price) and price > 0:
+                        pending_order = PendingRangeOrder(side=side, price=price, bar_i=i, order_type=pending_order_type)
+                        markers.append({"ts": signal_ts, "price": price, "type": "pending_set_long" if side == 1 else "pending_set_short"})
+                else:
+                    open_position("long" if side == 1 else "short", c, signal_ts, "range3_signal_after_flip")
+                continue
+
             current_side = 1 if position.direction == "long" else -1
             if side != current_side:
                 if recent_extreme:
