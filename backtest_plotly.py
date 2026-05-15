@@ -674,6 +674,7 @@ def run_range3_bb_lock_backtest(
     profit_lock_trigger_pct: float = 0.03,
     profit_lock_sl_pct: float = 0.005,
     use_trailing_stop: bool = False,
+    trailing_step_pct: float = 0.01,
     intrabar_ohlcv: Optional[pd.DataFrame] = None,
     active_start: Optional[pd.Timestamp] = None,
     active_end: Optional[pd.Timestamp] = None,
@@ -790,14 +791,17 @@ def run_range3_bb_lock_backtest(
             return
 
         if use_trailing_stop:
+            step_pct = max(float(trailing_step_pct), 1e-12)
             if position.direction == "long":
-                new_sl = hi * (1 - stop_loss_pct)
-                if position.sl_price is None or new_sl > position.sl_price:
+                steps = int(np.floor(max(0.0, (hi / position.entry_price - 1.0)) / step_pct))
+                new_sl = position.entry_price * (1 - stop_loss_pct + steps * step_pct)
+                if steps > 0 and (position.sl_price is None or new_sl > position.sl_price):
                     position.sl_price = new_sl
                     markers.append({"ts": event_ts, "price": position.sl_price, "type": "trail_sl_long"})
             elif position.direction == "short":
-                new_sl = lo * (1 + stop_loss_pct)
-                if position.sl_price is None or new_sl < position.sl_price:
+                steps = int(np.floor(max(0.0, (1.0 - lo / position.entry_price)) / step_pct))
+                new_sl = position.entry_price * (1 + stop_loss_pct - steps * step_pct)
+                if steps > 0 and (position.sl_price is None or new_sl < position.sl_price):
                     position.sl_price = new_sl
                     markers.append({"ts": event_ts, "price": position.sl_price, "type": "trail_sl_short"})
         elif not position.profit_lock_done:
@@ -1410,6 +1414,7 @@ def main() -> int:
     parser.add_argument("--profit-lock-trigger", type=float, default=0.03)
     parser.add_argument("--profit-lock-sl", type=float, default=0.005)
     parser.add_argument("--range-use-trailing-stop", action="store_true")
+    parser.add_argument("--range-trailing-step", type=float, default=0.01)
     args = parser.parse_args()
 
     p = Path(args.parquet_path)
@@ -1535,6 +1540,7 @@ def main() -> int:
             profit_lock_trigger_pct=args.profit_lock_trigger,
             profit_lock_sl_pct=args.profit_lock_sl,
             use_trailing_stop=args.range_use_trailing_stop,
+            trailing_step_pct=args.range_trailing_step,
             intrabar_ohlcv=intrabar_ohlcv,
             active_start=start_ts,
             active_end=end_ts,
