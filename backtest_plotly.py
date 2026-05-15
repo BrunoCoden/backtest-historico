@@ -792,7 +792,17 @@ def run_range3_bb_lock_backtest(
 
         if use_trailing_stop:
             step_pct = max(float(trailing_step_pct), 1e-12)
-            if position.direction == "long":
+            if not position.profit_lock_done and position.direction == "long" and hi >= position.entry_price * (1 + profit_lock_trigger_pct):
+                position.sl_price = position.entry_price * (1 + profit_lock_sl_pct)
+                position.profit_lock_done = True
+                markers.append({"ts": event_ts, "price": position.sl_price, "type": "profit_lock_long"})
+            elif not position.profit_lock_done and position.direction == "short" and lo <= position.entry_price * (1 - profit_lock_trigger_pct):
+                position.sl_price = position.entry_price * (1 - profit_lock_sl_pct)
+                position.profit_lock_done = True
+                markers.append({"ts": event_ts, "price": position.sl_price, "type": "profit_lock_short"})
+            elif position.profit_lock_done:
+                pass
+            elif position.direction == "long":
                 steps = int(np.floor(max(0.0, (hi / position.entry_price - 1.0)) / step_pct))
                 new_sl = position.entry_price * (1 - stop_loss_pct + steps * step_pct)
                 if steps > 0 and (position.sl_price is None or new_sl > position.sl_price):
@@ -818,10 +828,10 @@ def run_range3_bb_lock_backtest(
             return
 
         if position.direction == "long" and lo <= position.sl_price:
-            reason = "trailing_stop" if use_trailing_stop else ("profit_lock_sl" if position.profit_lock_done else "stop_loss")
+            reason = "profit_lock_sl" if position.profit_lock_done else ("trailing_stop" if use_trailing_stop else "stop_loss")
             close_position(float(position.sl_price), event_ts, reason)
         elif position.direction == "short" and hi >= position.sl_price:
-            reason = "trailing_stop" if use_trailing_stop else ("profit_lock_sl" if position.profit_lock_done else "stop_loss")
+            reason = "profit_lock_sl" if position.profit_lock_done else ("trailing_stop" if use_trailing_stop else "stop_loss")
             close_position(float(position.sl_price), event_ts, reason)
 
     def valid_signal(i: int) -> int:
