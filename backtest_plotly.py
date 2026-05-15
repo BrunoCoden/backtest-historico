@@ -850,6 +850,19 @@ def run_range3_bb_lock_backtest(
         if not used_intrabar:
             evaluate_execution_path(i, h, l, ts, allow_pending_fill=True)
 
+        if pending_order is not None and i > pending_order.bar_i:
+            new_max_now = bool(high[i] >= max_line[i])
+            new_min_now = bool(low[i] <= min_line[i])
+            if (pending_order.side == -1 and new_max_now) or (pending_order.side == 1 and new_min_now):
+                markers.append(
+                    {
+                        "ts": ts,
+                        "price": pending_order.price,
+                        "type": "pending_cancel_new_extreme_short" if pending_order.side == -1 else "pending_cancel_new_extreme_long",
+                    }
+                )
+                pending_order = None
+
         side = valid_signal(i)
         if side == 0:
             continue
