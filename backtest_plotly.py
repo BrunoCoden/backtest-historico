@@ -673,6 +673,7 @@ def run_range3_bb_lock_backtest(
     stop_loss_pct: float = 0.02,
     profit_lock_trigger_pct: float = 0.03,
     profit_lock_sl_pct: float = 0.005,
+    use_trailing_stop: bool = False,
     intrabar_ohlcv: Optional[pd.DataFrame] = None,
     active_start: Optional[pd.Timestamp] = None,
     active_end: Optional[pd.Timestamp] = None,
@@ -788,7 +789,18 @@ def run_range3_bb_lock_backtest(
         if position is None:
             return
 
-        if not position.profit_lock_done:
+        if use_trailing_stop:
+            if position.direction == "long":
+                new_sl = hi * (1 - stop_loss_pct)
+                if position.sl_price is None or new_sl > position.sl_price:
+                    position.sl_price = new_sl
+                    markers.append({"ts": event_ts, "price": position.sl_price, "type": "trail_sl_long"})
+            elif position.direction == "short":
+                new_sl = lo * (1 + stop_loss_pct)
+                if position.sl_price is None or new_sl < position.sl_price:
+                    position.sl_price = new_sl
+                    markers.append({"ts": event_ts, "price": position.sl_price, "type": "trail_sl_short"})
+        elif not position.profit_lock_done:
             if position.direction == "long" and hi >= position.entry_price * (1 + profit_lock_trigger_pct):
                 position.sl_price = position.entry_price * (1 + profit_lock_sl_pct)
                 position.profit_lock_done = True
@@ -802,10 +814,10 @@ def run_range3_bb_lock_backtest(
             return
 
         if position.direction == "long" and lo <= position.sl_price:
-            reason = "profit_lock_sl" if position.profit_lock_done else "stop_loss"
+            reason = "trailing_stop" if use_trailing_stop else ("profit_lock_sl" if position.profit_lock_done else "stop_loss")
             close_position(float(position.sl_price), event_ts, reason)
         elif position.direction == "short" and hi >= position.sl_price:
-            reason = "profit_lock_sl" if position.profit_lock_done else "stop_loss"
+            reason = "trailing_stop" if use_trailing_stop else ("profit_lock_sl" if position.profit_lock_done else "stop_loss")
             close_position(float(position.sl_price), event_ts, reason)
 
     def valid_signal(i: int) -> int:
@@ -1397,6 +1409,7 @@ def main() -> int:
     parser.add_argument("--range-extremes-disable-tp", action="store_true")
     parser.add_argument("--profit-lock-trigger", type=float, default=0.03)
     parser.add_argument("--profit-lock-sl", type=float, default=0.005)
+    parser.add_argument("--range-use-trailing-stop", action="store_true")
     args = parser.parse_args()
 
     p = Path(args.parquet_path)
@@ -1521,6 +1534,7 @@ def main() -> int:
             stop_loss_pct=args.sl,
             profit_lock_trigger_pct=args.profit_lock_trigger,
             profit_lock_sl_pct=args.profit_lock_sl,
+            use_trailing_stop=args.range_use_trailing_stop,
             intrabar_ohlcv=intrabar_ohlcv,
             active_start=start_ts,
             active_end=end_ts,
