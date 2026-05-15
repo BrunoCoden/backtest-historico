@@ -676,6 +676,7 @@ def run_range3_bb_lock_backtest(
     profit_lock_sl_pct: float = 0.005,
     use_trailing_stop: bool = False,
     trailing_step_pct: float = 0.01,
+    enable_flip_after_signal_sl: bool = True,
     flip_sl_pct: float = 0.02,
     flip_tp_pct: float = 0.02,
     intrabar_ohlcv: Optional[pd.DataFrame] = None,
@@ -856,7 +857,7 @@ def run_range3_bb_lock_backtest(
                 reason = "flip_take_profit"
 
         if exit_price is not None:
-            should_flip = position.source == "signal" and reason in {"stop_loss", "trailing_stop", "profit_lock_sl"}
+            should_flip = enable_flip_after_signal_sl and position.source == "signal" and reason in {"stop_loss", "trailing_stop", "profit_lock_sl"}
             flip_direction = "short" if position.direction == "long" else "long"
             closed = close_position(exit_price, event_ts, reason)
             if should_flip and closed is not None:
@@ -1464,6 +1465,7 @@ def main() -> int:
     parser.add_argument("--profit-lock-sl", type=float, default=0.005)
     parser.add_argument("--range-use-trailing-stop", action="store_true")
     parser.add_argument("--range-trailing-step", type=float, default=0.01)
+    parser.add_argument("--range-disable-flip", action="store_true")
     args = parser.parse_args()
 
     p = Path(args.parquet_path)
@@ -1590,6 +1592,7 @@ def main() -> int:
             profit_lock_sl_pct=args.profit_lock_sl,
             use_trailing_stop=args.range_use_trailing_stop,
             trailing_step_pct=args.range_trailing_step,
+            enable_flip_after_signal_sl=not args.range_disable_flip,
             intrabar_ohlcv=intrabar_ohlcv,
             active_start=start_ts,
             active_end=end_ts,
